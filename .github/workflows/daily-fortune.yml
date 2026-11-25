@@ -1,7 +1,7 @@
 # 매일 자동 수집 (Daily fortune)
 #
 # 담당자 컴퓨터를 켜지 않아도 매일 아침 운세가 수집되도록, GitHub Actions가
-# scripts/scrape_daily.py를 실행해 데이터 파일 3개만 커밋합니다.
+# scripts/scrape_daily.py를 실행해 데이터 파일과 번역 캐시를 커밋합니다.
 # 사이트 소스가 레포에 없어서 빌드를 다시 할 수 없지만, 두 페이지 모두
 # 데이터를 브라우저에서 fetch({cache: "no-store"})로 읽어오기 때문에
 # 데이터 파일만 갱신해도 사이트에 바로 반영됩니다. (자세한 내용은
@@ -50,6 +50,23 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+        with:
+          # A queued run is pinned to the SHA at dispatch time. Fetch a
+          # little history so we can fast-forward onto a partial commit
+          # pushed by a previous run and rebase if two runs overlap.
+          fetch-depth: 10
+
+      # workflow_dispatch checks out the SHA from when the run was clicked,
+      # which can be stale if a previous run already pushed today's image.
+      - name: Sync to latest main
+        run: |
+          git fetch origin main
+          # checkout@v4 leaves a detached HEAD at the triggering SHA.
+          if git merge-base --is-ancestor HEAD origin/main; then
+            git merge --ff-only origin/main
+          else
+            echo "checked-out commit is not an ancestor of origin/main; leaving it as-is"
+          fi
 
       - uses: actions/setup-python@v5
         with:
@@ -78,18 +95,29 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add fortune-index.json horoscope-editions.json fortunes/
+          git add fortune-index.json horoscope-editions.json fortunes/ scripts/translate-cache.json
           if git diff --cached --quiet; then
             echo "No new data to commit."
           else
             DATE_KST="${TARGET_DATE:-$(TZ=Asia/Seoul date +%F)}"
             git commit -m "Daily fortune: ${DATE_KST}" -m "Collected by scripts/scrape_daily.py (scheduled run)."
-            git push
+            # A second run may have been queued on an older SHA. Rebase
+            # onto the latest main before pushing so we do not reject.
+            i=0
+            until git pull --rebase origin main && git push; do
+              i=$((i+1))
+              if [ "$i" -ge 3 ]; then
+                echo "::error::commit push failed after rebase retries"
+                exit 1
+              fi
+              echo "push rejected, retrying rebase ($i/3)..."
+              sleep 5
+            done
           fi
 
       - name: Fail the run if collection did not finish
         if: steps.scrape.outcome == 'failure'
         run: |
-          echo "::error::수집이 끝나지 않았습니다. 로그에서 어느 쪽(인스타그램/아사히)이 안 올라왔는지 확인하세요."
+          echo "::error::수집이 끝나지 않았습니다. 로그에서 인스타그램, 아사히 피드, 또는 번역(429) 중 어디가 문제인지 확인하세요."
           echo "수동 재실행: Actions > Daily fortune > Run workflow (date 입력 가능)"
           exit 1

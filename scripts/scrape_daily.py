@@ -28,13 +28,19 @@ Translation notes (read scripts/README.md for the full story):
 - Lucky items (``lucky``) come from ``glossary.json`` first. It was
   built by aligning the 12 existing human-translated editions with the
   original Japanese, so recurring items keep the site's own wording.
-  Unknown items fall back to Google Translate (direct ja -> ko).
+  Unknown items fall back to Google Translate (direct ja -> ko), then
+  to the MyMemory public API if Google rate-limits the runner.
 - Summaries are translated with Google Translate via an English pivot
   (ja -> en -> ko). Direct ja -> ko mangled this colloquial horoscope
   Japanese ("チャンスが舞い込む" -> "기회가 춤춘다"), while the pivot
   stays close to the human translations. It is still machine
   translation: the Japanese original is kept in ``ja_summary`` /
   ``ja_lucky`` so any awkward line can be traced and fixed by hand.
+- Translations are cached in ``scripts/translate-cache.json`` (keyed by
+  source text and language pair) so repeated words are never requested
+  again. Google 429 responses honor Retry-After, back off with jitter,
+  and are retried; a failed translation is also retried in the wait loop
+  instead of crashing the process immediately.
 
 Exit codes: 0 = collected (or already up to date), 1 = hard error,
 2 = today's data not published yet (after waiting).
@@ -44,9 +50,11 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import email.utils
 import html as htmlmod
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -94,6 +102,10 @@ SIGN_BY_CODE = {
 FORTUNE_INDEX = "fortune-index.json"
 HOROSCOPE_EDITIONS = "horoscope-editions.json"
 FORTUNES_DIR = "fortunes"
+TRANSLATE_CACHE = os.path.join("scripts", "translate-cache.json")
+TRANSLATE_MIN_INTERVAL = 1.0
+TRANSLATE_MAX_ATTEMPTS = 7
+TRANSLATE_MAX_SLEEP = 90.0
 
 
 def log(msg: str) -> None:
@@ -121,27 +133,262 @@ def http_get(url: str, timeout: int = 25, user_agent: str | None = None) -> byte
 # Translation (Google Translate web endpoint, no key needed)
 # --------------------------------------------------------------------------
 
-def google_translate(text: str, src: str, tgt: str) -> str:
+# Pace HTTP calls across the process, and skip Google for the rest of
+# a collect_once attempt once it has been rate-limited.
+_last_translate_http = 0.0
+_google_rate_limited = False
+
+
+def _pace_translate() -> None:
+    """Wait so consecutive translate HTTP calls are at least MIN_INTERVAL apart."""
+    global _last_translate_http
+    gap = TRANSLATE_MIN_INTERVAL - (time.monotonic() - _last_translate_http)
+    if gap > 0:
+        time.sleep(gap)
+
+
+def _mark_translate_http() -> None:
+    global _last_translate_http
+    _last_translate_http = time.monotonic()
+
+
+def _retry_after_seconds(exc: Exception, attempt: int) -> float:
+    """Sleep length for a failed translate attempt: Retry-After or exp. backoff + jitter."""
+    retry_after: float | None = None
+    if isinstance(exc, urllib.error.HTTPError) and exc.headers:
+        raw = exc.headers.get("Retry-After")
+        if raw:
+            try:
+                retry_after = float(raw)
+            except ValueError:
+                try:
+                    when = email.utils.parsedate_to_datetime(raw)
+                    if when.tzinfo is None:
+                        when = when.replace(tzinfo=dt.timezone.utc)
+                    retry_after = max(
+                        0.0, (when - dt.datetime.now(dt.timezone.utc)).total_seconds()
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    retry_after = None
+    base = float(2 ** attempt)  # 2, 4, 8, 16, ...
+    sleep_for = retry_after if retry_after is not None else base
+    sleep_for = min(TRANSLATE_MAX_SLEEP, max(1.0, sleep_for))
+    return sleep_for + random.uniform(0, 0.3 * sleep_for)
+
+
+def _is_retryable_translate(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in {408, 425, 429, 500, 502, 503, 504} or exc.code == 403
+    return isinstance(exc, (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError))
+
+
+class TranslateCache:
+    """JSON cache keyed by 'src|tgt|text'. Written after every new hit."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.data: dict[str, str] = {}
+        if os.path.exists(path):
+            try:
+                raw = load_json(path, {})
+                if isinstance(raw, dict):
+                    self.data = {str(k): str(v) for k, v in raw.items()}
+            except (OSError, json.JSONDecodeError) as exc:
+                log(f"translate cache unreadable, starting empty: {exc}")
+        log(f"translate cache: {len(self.data)} entries ({path})")
+
+    @staticmethod
+    def make_key(text: str, src: str, tgt: str) -> str:
+        return f"{src}|{tgt}|{text}"
+
+    def get(self, text: str, src: str, tgt: str) -> str | None:
+        return self.data.get(self.make_key(text, src, tgt))
+
+    def put(self, text: str, src: str, tgt: str, value: str) -> None:
+        key = self.make_key(text, src, tgt)
+        if self.data.get(key) == value:
+            return
+        self.data[key] = value
+        self._save()
+
+    def _save(self) -> None:
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        dump_json(self.path, dict(sorted(self.data.items())))
+
+
+def _parse_google_payload(data) -> str:
+    if not data or not data[0]:
+        raise RuntimeError("Google Translate returned an empty payload")
+    return "".join(part[0] for part in data[0] if part and part[0]).strip()
+
+
+def _google_translate_http(text: str, src: str, tgt: str) -> str:
+    """One Google Translate request with retry/backoff. Does not use the cache."""
+    global _google_rate_limited
     query = urllib.parse.urlencode(
         {"client": "gtx", "sl": src, "tl": tgt, "dt": "t", "q": text}
     )
     url = "https://translate.googleapis.com/translate_a/single?" + query
     last: Exception | None = None
-    for attempt in range(1, 4):
+    for attempt in range(1, TRANSLATE_MAX_ATTEMPTS + 1):
         try:
+            _pace_translate()
             req = urllib.request.Request(url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = json.load(resp)
-            return "".join(part[0] for part in data[0] if part[0]).strip()
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    data = json.load(resp)
+            finally:
+                _mark_translate_http()
+            out = _parse_google_payload(data)
+            if not out:
+                raise RuntimeError("Google Translate returned an empty string")
+            return out
         except Exception as exc:  # noqa: BLE001 - retry, then surface
             last = exc
-            time.sleep(3 * attempt)
+            retryable = _is_retryable_translate(exc)
+            code = getattr(exc, "code", None)
+            log(
+                f"Google Translate {src}->{tgt} failed "
+                f"(attempt {attempt}/{TRANSLATE_MAX_ATTEMPTS}): {exc}"
+            )
+            if (not retryable) or attempt >= TRANSLATE_MAX_ATTEMPTS:
+                break
+            sleep_for = _retry_after_seconds(exc, attempt)
+            if code == 429:
+                log(f"HTTP 429, backing off {sleep_for:.1f}s")
+            else:
+                log(f"retrying in {sleep_for:.1f}s")
+            time.sleep(sleep_for)
+    if isinstance(last, urllib.error.HTTPError) and last.code in {403, 429}:
+        _google_rate_limited = True
     raise RuntimeError(f"translate {src}->{tgt} failed: {text!r}") from last
 
 
-def translate_summary(ja_text: str) -> str:
+def mymemory_translate(text: str, src: str, tgt: str) -> str:
+    """Public MyMemory fallback (no API key). Used only after Google is exhausted."""
+    query = urllib.parse.urlencode({"q": text, "langpair": f"{src}|{tgt}"})
+    url = "https://api.mymemory.translated.net/get?" + query
+    _pace_translate()
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.load(resp)
+    finally:
+        _mark_translate_http()
+    translated = (data.get("responseData") or {}).get("translatedText") or ""
+    translated = htmlmod.unescape(str(translated)).strip()
+    upper = translated.upper()
+    if (
+        not translated
+        or upper.startswith("MYMEMORY")
+        or "QUERY LENGTH" in upper
+        or "INVALID LANGUAGE" in upper
+    ):
+        raise RuntimeError(f"mymemory rejected {text!r}: {translated!r}")
+    return translated
+
+
+def google_translate(text: str, src: str, tgt: str,
+                     cache: "TranslateCache | None" = None) -> str:
+    """Translate one string, using the cache, Google, then MyMemory."""
+    global _google_rate_limited
+    text = text.strip()
+    if not text:
+        return ""
+    if cache:
+        hit = cache.get(text, src, tgt)
+        if hit is not None:
+            return hit
+    last: Exception | None = None
+    if not _google_rate_limited:
+        try:
+            out = _google_translate_http(text, src, tgt)
+            if cache:
+                cache.put(text, src, tgt, out)
+            return out
+        except Exception as exc:  # noqa: BLE001 - fall back
+            last = exc
+            _google_rate_limited = True
+            log("Google Translate exhausted; using MyMemory for the rest of this attempt")
+    try:
+        out = mymemory_translate(text, src, tgt)
+        if cache:
+            cache.put(text, src, tgt, out)
+        log(f"MyMemory fallback {src}->{tgt}: {text!r} -> {out!r}")
+        return out
+    except Exception as exc:  # noqa: BLE001 - surface both failures
+        raise RuntimeError(f"translate {src}->{tgt} failed: {text!r}") from (last or exc)
+
+
+def google_translate_many(texts: list[str], src: str, tgt: str,
+                          cache: "TranslateCache | None" = None) -> list[str]:
+    """Translate many strings, batching uncached ones into one Google request when possible."""
+    results: list[str | None] = [None] * len(texts)
+    missing: list[int] = []
+    for i, raw in enumerate(texts):
+        text = raw.strip()
+        if not text:
+            results[i] = ""
+            continue
+        if cache:
+            hit = cache.get(text, src, tgt)
+            if hit is not None:
+                results[i] = hit
+                continue
+        missing.append(i)
+    if not missing:
+        return [r or "" for r in results]
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for i in missing:
+        text = texts[i].strip()
+        if text not in seen:
+            seen.add(text)
+            unique.append(text)
+
+    translated: dict[str, str] = {}
+    can_batch = (
+        len(unique) > 1
+        and (not _google_rate_limited)
+        and all("\n" not in t for t in unique)
+    )
+    if can_batch:
+        try:
+            blob = "\n".join(unique)
+            raw = _google_translate_http(blob, src, tgt)
+            lines = [ln.strip() for ln in raw.split("\n")]
+            if len(lines) != len(unique) or any(not ln for ln in lines):
+                raise RuntimeError(
+                    f"batch split {len(lines)} lines, expected {len(unique)}"
+                )
+            for src_text, out in zip(unique, lines):
+                if cache:
+                    cache.put(src_text, src, tgt, out)
+                translated[src_text] = out
+        except Exception as exc:  # noqa: BLE001 - one-by-one is the safe path
+            log(f"batch translate {src}->{tgt} failed, one-by-one: {exc}")
+            translated.clear()
+    if len(translated) != len(unique):
+        for src_text in unique:
+            if src_text not in translated:
+                translated[src_text] = google_translate(src_text, src, tgt, cache)
+
+    for i in missing:
+        results[i] = translated[texts[i].strip()]
+    return [r or "" for r in results]
+
+
+def translate_summary(ja_text: str, cache: TranslateCache) -> str:
     """Japanese horoscope summary -> Korean, via an English pivot."""
-    return google_translate(google_translate(ja_text, "ja", "en"), "en", "ko")
+    hit = cache.get(ja_text, "ja", "ko")
+    if hit is not None:
+        return hit
+    ko = google_translate(google_translate(ja_text, "ja", "en", cache), "en", "ko", cache)
+    cache.put(ja_text, "ja", "ko", ko)
+    return ko
 
 
 def load_glossary(root: str) -> dict:
@@ -324,28 +571,65 @@ def fetch_abc(target: dt.date) -> list[dict] | None:
     return entries
 
 
-def translate_entries(entries: list[dict], glossary: dict) -> list[dict]:
-    out: list[dict] = []
+def translate_entries(entries: list[dict], glossary: dict,
+                      cache: TranslateCache) -> list[dict]:
+    global _google_rate_limited
+    _google_rate_limited = False
+
+    luckies: list[str | None] = []
+    uncached_lucky: list[str] = []
     for entry in entries:
         lucky_ja = entry["ja_lucky"]
         lucky = glossary.get(lucky_ja)
         if lucky:
             log(f"lucky {lucky_ja!r} -> glossary {lucky!r}")
-        else:
-            lucky = google_translate(lucky_ja, "ja", "ko")
+            luckies.append(lucky)
+            continue
+        hit = cache.get(lucky_ja, "ja", "ko")
+        if hit is not None:
+            log(f"lucky {lucky_ja!r} -> cache {hit!r}")
+            luckies.append(hit)
+            continue
+        luckies.append(None)
+        uncached_lucky.append(lucky_ja)
+
+    if uncached_lucky:
+        got = google_translate_many(uncached_lucky, "ja", "ko", cache)
+        it = iter(got)
+        luckies = [lu if lu is not None else next(it) for lu in luckies]
+        for lucky_ja, lucky in zip(uncached_lucky, got):
             log(f"lucky {lucky_ja!r} -> translated {lucky!r}")
-        summary = translate_summary(entry["ja_summary"])
+
+    summaries: list[str | None] = []
+    uncached_sum: list[str] = []
+    for entry in entries:
+        hit = cache.get(entry["ja_summary"], "ja", "ko")
+        if hit is not None:
+            summaries.append(hit)
+        else:
+            summaries.append(None)
+            uncached_sum.append(entry["ja_summary"])
+    if uncached_sum:
+        # Pivot ja -> en -> ko, batched, then remember the direct ja -> ko mapping.
+        ens = google_translate_many(uncached_sum, "ja", "en", cache)
+        kos = google_translate_many(ens, "en", "ko", cache)
+        for ja, ko in zip(uncached_sum, kos):
+            cache.put(ja, "ja", "ko", ko)
+        it = iter(kos)
+        summaries = [su if su is not None else next(it) for su in summaries]
+
+    out: list[dict] = []
+    for entry, lucky, summary in zip(entries, luckies, summaries):
         out.append(
             {
                 "rank": entry["rank"],
                 "sign": entry["sign"],
-                "summary": summary,
-                "lucky": lucky,
+                "summary": summary or "",
+                "lucky": lucky or "",
                 "ja_summary": entry["ja_summary"],
-                "ja_lucky": lucky_ja,
+                "ja_lucky": entry["ja_lucky"],
             }
         )
-        time.sleep(0.4)  # be gentle with the translate endpoint
     return out
 
 
@@ -400,7 +684,7 @@ def update_horoscope(root: str, target: dt.date, entries: list[dict]) -> bool:
 # --------------------------------------------------------------------------
 
 def collect_once(root: str, target: dt.date, shortcode_override: str | None,
-                 glossary: dict) -> tuple[bool, bool]:
+                 glossary: dict, cache: TranslateCache) -> tuple[bool, bool]:
     """One attempt. Returns (fortune_satisfied, horoscope_satisfied):
     True when that side's data for the date is present (newly collected
     or already there), False when it still needs to be waited for."""
@@ -434,8 +718,11 @@ def collect_once(root: str, target: dt.date, shortcode_override: str | None,
         if entries is None:
             log("horoscope not published yet")
         else:
-            translated = translate_entries(entries, glossary)
-            horoscope_done = update_horoscope(root, target, translated)
+            try:
+                translated = translate_entries(entries, glossary, cache)
+                horoscope_done = update_horoscope(root, target, translated)
+            except Exception as exc:  # noqa: BLE001 - retried by the wait loop
+                log(f"horoscope translation failed: {exc}")
     return fortune_done, horoscope_done
 
 
@@ -459,6 +746,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         target = dt.datetime.now(KST).date()
     glossary = load_glossary(root)
+    cache = TranslateCache(os.path.join(root, TRANSLATE_CACHE))
     log(f"target date: {target} ({target.strftime('%A')}), root: {root}")
 
     deadline = time.monotonic() + max(0, args.wait_minutes) * 60
@@ -467,7 +755,7 @@ def main(argv: list[str] | None = None) -> int:
         attempt += 1
         log(f"attempt {attempt}")
         fortune_done, horoscope_done = collect_once(
-            root, target, args.fortune_shortcode or None, glossary
+            root, target, args.fortune_shortcode or None, glossary, cache
         )
         if fortune_done and horoscope_done:
             # Both sides done. But "done" also means "already collected":
