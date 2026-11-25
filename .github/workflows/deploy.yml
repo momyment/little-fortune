@@ -1,0 +1,79 @@
+name: Build and deploy to GitHub Pages
+
+# 소스(site/)에서 Next.js 정적 빌드를 만들어 GitHub Pages에 배포한다.
+# 매일 데이터 커밋(운세 JSON 업데이트)이 main에 푸시될 때마다
+# 새로 빌드하므로, 배포된 페이지에는 항상 최신 날짜 운세가 박힌다.
+#
+# 배치 위치: 이 파일은 저장소 루트의 .github/workflows/deploy.yml 로 둔다.
+# (소스 프로젝트는 저장소 루트의 site/ 디렉터리에 들어간다고 가정한다.)
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - name: Install dependencies
+        working-directory: site
+        run: npm ci
+
+      - name: Build static export
+        working-directory: site
+        # 빌드 시점에 이번 커밋의 horoscope-editions.json을 가져와
+        # 정적 HTML에 박아 넣는다. 라이브 사이트의 JSON을 쓰면
+        # 배포된 페이지가 아직 어제 날짜인 동안의 레이스가 생기므로,
+        # 푸시된 커밋의 데이터를 직접 읽는 것이 정확하다.
+        env:
+          HOROSCOPE_DATA_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/horoscope-editions.json
+        run: npm run build
+
+      - name: Assemble deploy artifact
+        # site/에는 별자리 페이지 소스만 있다. 새 빌드(out/)에는
+        # 별자리 페이지뿐이라, 그대로 배포하면 아직 소스가 없는
+        # 메인 인덱스 페이지(띠별 운세)가 사라진다. 그래서 배포물에
+        # 루트의 정적 파일들을 합친다:
+        # - index.html, fortunes/, 데이터 JSON, favicon 등 루트 파일
+        # - _next/ (구 빌드 청크: 인덱스 페이지의 JS/CSS가 여기에 있다.
+        #   별자리 페이지 청크는 새 빌드의 것과 해시가 달라 겹치지 않는다)
+        # horoscope/는 새 빌드로 대체되므로 루트의 구버전은 복사하지 않는다.
+        run: |
+          rm -rf deploy
+          mkdir deploy
+          cp -r site/out/. deploy/
+          cp index.html fortune-index.json horoscope-editions.json favicon.svg .nojekyll deploy/
+          cp -r fortunes deploy/
+          cp -r _next deploy/
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: deploy
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
