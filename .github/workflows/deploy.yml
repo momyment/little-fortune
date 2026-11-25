@@ -24,6 +24,11 @@ concurrency:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    # deploy-pages 액션은 job에 environment 선언이 필수다.
+    # 없으면 "Missing environment" 에러로 배포 단계가 실패한다.
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
