@@ -62,6 +62,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from write_api import write_api
+
 KST = dt.timezone(dt.timedelta(hours=9))
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -664,6 +666,7 @@ def update_fortune(root: str, target: dt.date, post: dict) -> bool:
     index[key] = post["shortcode"]
     dump_json(index_path, index)
     log(f"fortune-index.json: {key} -> {post['shortcode']}")
+    write_api(root)
     return True
 
 
@@ -678,6 +681,7 @@ def update_horoscope(root: str, target: dt.date, entries: list[dict]) -> bool:
     editions.sort(key=lambda e: e.get("date", ""))
     dump_json(path, editions)
     log(f"horoscope-editions.json: added {key} ({len(entries)} signs)")
+    write_api(root)
     return True
 
 
@@ -767,6 +771,7 @@ def main(argv: list[str] | None = None) -> int:
                 e.get("date") == target.isoformat() for e in editions
             )
             if has_fortune and has_horoscope:
+                write_api(root)
                 log(f"all done for {target}")
                 return 0
         if time.monotonic() >= deadline:

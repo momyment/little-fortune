@@ -1,21 +1,27 @@
 name: Build and deploy to GitHub Pages
 
-# 소스(site/)에서 Next.js 정적 빌드를 만들어 GitHub Pages에 배포한다.
-# 매일 데이터 커밋(운세 JSON 업데이트)이 main에 푸시될 때마다
-# 새로 빌드하므로, 배포된 페이지에는 항상 최신 날짜 운세가 박힌다.
+# 소스(site/)가 바뀌었을 때만 Next.js 정적 빌드를 만들고, GitHub Pages가
+# 읽는 main 브랜치에 결과물을 커밋한다. 운세 데이터는 api/v1/*.json 으로
+# 따로 올라가며, 페이지가 런타임에 가져가므로 데이터만 바뀌면 리빌드하지 않는다.
 #
-# 배치 위치: 이 파일은 저장소 루트의 .github/workflows/deploy.yml 로 둔다.
-# (소스 프로젝트는 저장소 루트의 site/ 디렉터리에 들어간다고 가정한다.)
+# Pages 설정은 main 브랜치 루트(/)를 배포하는 legacy 방식이다.
+# actions/deploy-pages는 쓰지 않는다. 수동 실행에서 아티팩트 업로드는
+# 됐지만 deploy-pages가 곧바로 아티팩트를 찾지 못했고, 예전에
+# deploy-pages가 성공해도 라이브 주소는 main 루트의 파일을 보여 줬다.
+#
+# Daily fortune의 GITHUB_TOKEN 푸시는 이 워크플로를 시작시키지 않는다.
+# 데이터가 아니라 소스(site/ 또는 이 파일)가 바뀔 때만 빌드한다.
 
 on:
   push:
     branches: ["main"]
+    paths:
+      - "site/**"
+      - ".github/workflows/deploy.yml"
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
 concurrency:
   group: "pages"
@@ -24,14 +30,12 @@ concurrency:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    # deploy-pages 액션은 job에 environment 선언이 필수다.
-    # 없으면 "Missing environment" 에러로 배포 단계가 실패한다.
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 10
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -46,39 +50,28 @@ jobs:
 
       - name: Build static export
         working-directory: site
-        # 빌드 시점에 이번 커밋의 horoscope-editions.json을 가져와
-        # 정적 HTML에 박아 넣는다. 라이브 사이트의 JSON을 쓰면
-        # 배포된 페이지가 아직 어제 날짜인 동안의 레이스가 생기므로,
-        # 푸시된 커밋의 데이터를 직접 읽는 것이 정확하다.
-        env:
-          HOROSCOPE_DATA_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/horoscope-editions.json
         run: npm run build
 
-      - name: Assemble deploy artifact
-        # site/에는 별자리 페이지 소스만 있다. 새 빌드(out/)에는
-        # 별자리 페이지뿐이라, 그대로 배포하면 아직 소스가 없는
-        # 메인 인덱스 페이지(띠별 운세)가 사라진다. 그래서 배포물에
-        # 루트의 정적 파일들을 합친다:
-        # - index.html, fortunes/, 데이터 JSON, favicon 등 루트 파일
-        # - _next/ (구 빌드 청크: 인덱스 페이지의 JS/CSS가 여기에 있다.
-        #   별자리 페이지 청크는 새 빌드의 것과 해시가 달라 겹치지 않는다)
-        # horoscope/는 새 빌드로 대체되므로 루트의 구버전은 복사하지 않는다.
+      - name: Commit built pages to main
+        # 별자리 페이지만 site/에서 빌드한다. 띠별 인덱스와 구 _next
+        # 청크, api/ 데이터 파일은 그대로 두고 horoscope/ 와 새 청크만
+        # 덮어쓴다. 이 커밋은 GITHUB_TOKEN 푸시라 deploy.yml을 다시
+        # 시작하지는 않지만, pages-build-deployment는 main 푸시를 받아
+        # 라이브 주소에 올린다.
         run: |
-          rm -rf deploy
-          mkdir deploy
-          cp -r site/out/. deploy/
-          cp index.html fortune-index.json horoscope-editions.json favicon.svg .nojekyll deploy/
-          cp -r fortunes deploy/
-          cp -r _next deploy/
-
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
-
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: deploy
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+          test -d site/out/horoscope
+          rm -rf horoscope
+          cp -r site/out/horoscope horoscope
+          if [ -d site/out/_next ]; then
+            cp -a site/out/_next/. _next/
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add horoscope _next
+          if git diff --cached --quiet; then
+            echo "No built pages to commit."
+          else
+            git commit -m "Rebuild horoscope pages" -m "Built from site/ (code change)."
+            git pull --rebase origin main
+            git push origin main
+          fi
