@@ -10,9 +10,13 @@ export function todayKst(): string {
 
 /** 오늘로부터 days일 전 날짜 (YYYY-MM-DD, 한국 시간 기준). */
 export function kstDaysAgo(days: number): string {
-  const today = todayKst();
+  return kstAddDays(todayKst(), -days);
+}
+
+/** 기준 날짜에서 days일만큼 이동한 날짜 (YYYY-MM-DD, 한국 시간 기준). */
+export function kstAddDays(date: string, days: number): string {
   return seoulFormat.format(
-    new Date(new Date(`${today}T12:00:00+09:00`).getTime() - 86400000 * days),
+    new Date(new Date(`${date}T12:00:00+09:00`).getTime() + 86400000 * days),
   );
 }
 

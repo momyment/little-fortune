@@ -1,11 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ReaderTop } from "./ReaderTop";
 import { HiddenCookie } from "./HiddenCookie";
 import { SIGN_ICONS } from "../lib/signIcons";
 import { todayKst } from "../lib/dates";
-import { withBasePath } from "../lib/basePath";
+import { horoscopeEditionsUrl, parseHoroscopeEditions } from "../lib/api";
 import type { HoroscopeEdition } from "../lib/types";
 
 const SIGNS = [
@@ -47,22 +47,16 @@ function SignIcon({ sign }: { sign: string }) {
 }
 
 /**
- * 별자리 운세 리더. 원본 빌드의 `app/horoscope/page-*.js` 모듈 3272와 동일.
- * - 날짜를 고르면 해당 날짜의 회차를 보여준다. (주말에는 회차가 없어 빈 상태)
- * - 생일(월/일)을 넣으면 별자리를 계산해 해당 별자리만 걸러서 보여준다.
- * - "다시 확인"은 horoscope-editions.json을 새로 받아온다 (cache: no-store).
+ * 별자리 운세 리더. 날짜와 회차는 빌드에 박지 않는다.
+ * 첫 화면은 서버/클라이언트가 같은 "불러오는 중" 상태라 #418이 나지 않고,
+ * 마운트 뒤에 오늘(KST)을 고르고 /api/v1/horoscope/editions.json 을 가져온다.
  */
-export default function HoroscopeReader({
-  editions,
-  sourceUrl,
-}: {
-  editions: HoroscopeEdition[];
-  sourceUrl: string;
-}) {
-  const [allEditions, setAllEditions] = useState(editions);
-  const [loading, setLoading] = useState(false);
+export default function HoroscopeReader({ sourceUrl }: { sourceUrl: string }) {
+  const [allEditions, setAllEditions] = useState<HoroscopeEdition[]>([]);
+  const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
-  const [date, setDate] = useState(todayKst);
+  const [date, setDate] = useState("");
+  const [today, setToday] = useState("");
   const [birthMonth, setBirthMonth] = useState("");
   const [birthDay, setBirthDay] = useState("");
   const [signFilter, setSignFilter] = useState("");
@@ -74,22 +68,21 @@ export default function HoroscopeReader({
     month <= 12 &&
     day >= 1 &&
     day <= DAYS_IN_MONTH[month - 1];
-  const dayOfWeek = new Date(`${date}T00:00:00Z`).getUTCDay();
+  const dayOfWeek = date ? new Date(`${date}T00:00:00Z`).getUTCDay() : -1;
   const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
   const edition = allEditions.find((entry) => entry.date === date);
   const entries = edition?.entries.filter(
     (entry) => !signFilter || entry.sign === signFilter,
   );
+  const ready = Boolean(date && today);
 
   async function refresh() {
     setLoading(true);
     setLoadError(false);
     try {
-      const res = await fetch(withBasePath("/horoscope-editions.json"), {
-        cache: "no-store",
-      });
+      const res = await fetch(horoscopeEditionsUrl(), { cache: "no-store" });
       if (!res.ok) throw new Error("Refresh failed");
-      setAllEditions(await res.json());
+      setAllEditions(parseHoroscopeEditions(await res.json()));
     } catch {
       setLoadError(true);
     } finally {
@@ -97,10 +90,20 @@ export default function HoroscopeReader({
     }
   }
 
+  useEffect(() => {
+    const current = todayKst();
+    setToday(current);
+    setDate(current);
+    void refresh();
+    // 마운트 때 한 번만. 오늘 날짜는 여기서만 정해서 첫 HTML과 어긋나지 않게 한다.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
     <section className="reader">
       <ReaderTop
         date={date}
+        today={today}
         loading={loading}
         onDateChange={setDate}
         onRefresh={refresh}
@@ -156,7 +159,15 @@ export default function HoroscopeReader({
         {signFilter && <small>{signFilter} 운세</small>}
       </form>
       <HiddenCookie piece="horoscope" />
-      {edition ? (
+      {!ready ? (
+        <div className="paper">
+          <div className="empty">
+            <span className="orb">☁</span>
+            <h3>불러오는 중…</h3>
+            <p>오늘의 별자리 운세를 확인하고 있어요.</p>
+          </div>
+        </div>
+      ) : edition ? (
         <>
           <p className="check-status">한국어 번역</p>
           <ol className="asahi-ranking">

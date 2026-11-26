@@ -1,2 +1,5 @@
 __pycache__/
 *.py[cod]
+site/node_modules/
+site/.next/
+site/out/

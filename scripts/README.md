@@ -50,6 +50,19 @@ python3 scripts/scrape_daily.py --date 2026-11-24 --fortune-shortcode DgFpujpjEQ
 
 이미 수집된 날짜는 다시 실행해도 아무것도 바꾸지 않습니다.
 
+## 공개 API (api/v1)
+
+별자리 페이지는 빌드에 날짜를 박지 않고, 브라우저에서 아래 JSON을 읽어 그립니다.
+
+- `/api/v1/horoscope/editions.json` — 전체 회차 목록
+- `/api/v1/horoscope/YYYY-MM-DD.json` — 하루 회차
+- `/api/v1/fortunes/index.json` — 띠별 운세 이미지 인덱스
+
+`scripts/scrape_daily.py`가 수집할 때마다 이 파일들을 다시 씁니다.
+이미 있는 `horoscope-editions.json` / `fortune-index.json`에서도
+`python3 scripts/write_api.py`로 한꺼번에 만들 수 있습니다.
+데이터만 바뀌면 사이트를 다시 빌드할 필요는 없습니다.
+
 ## 별자리 번역 방식과 한계
 
 아사히 원문은 일본어이고, 매일 문장이 새로 쓰입니다. 기존 12개 회차를

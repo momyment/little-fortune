@@ -1,24 +1,50 @@
 "use client";
 
-import { kstDaysAgo, todayKst, formatKoreanDate, weekdayShort } from "../lib/dates";
+import { formatKoreanDate, kstAddDays, weekdayShort } from "../lib/dates";
 
 /**
- * 날짜 선택 + 새로고침 바. 원본 빌드의 모듈 6693 `Ay`와 동일.
- * 오늘부터 7일치 버튼과 날짜 입력(달력)을 제공한다.
+ * 날짜 선택 + 새로고침 바.
+ * today는 부모가 넘긴다. 여기서 오늘을 직접 계산하면
+ * 빌드 HTML과 방문 시각이 달라 #418이 난다.
+ * today/date가 비어 있으면 서버와 같은 "불러오는 중" 화면만 그린다.
  */
 export function ReaderTop({
   date,
+  today,
   loading,
   onDateChange,
   onRefresh,
 }: {
   date: string;
+  today: string;
   loading: boolean;
   onDateChange: (date: string) => void;
   onRefresh: () => void;
 }) {
-  const today = todayKst();
-  const days = Array.from({ length: 7 }, (_, index) => kstDaysAgo(index));
+  if (!date || !today) {
+    return (
+      <>
+        <div className="reader-top">
+          <div>
+            <span className="badge">TODAY</span>
+            <h2>불러오는 중…</h2>
+          </div>
+          <button
+            className="refresh"
+            disabled
+            aria-busy="true"
+            aria-label="운세 새로고침"
+            title="다시 확인"
+          >
+            확인 중…
+          </button>
+        </div>
+        <div className="dates" />
+      </>
+    );
+  }
+
+  const days = Array.from({ length: 7 }, (_, index) => kstAddDays(today, -index));
 
   return (
     <>
