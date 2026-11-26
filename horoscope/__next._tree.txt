@@ -1,3 +1,0 @@
-:HL["/little-fortune/_next/static/css/54ebb477aa20cd77.css","style"]
-:HL["/little-fortune/_next/static/css/72d2be2981a48f95.css","style"]
-0:{"tree":{"name":"","param":null,"prefetchHints":4176,"slots":{"children":{"name":"horoscope","param":null,"prefetchHints":4192,"slots":{"children":{"name":"__PAGE__","param":null,"prefetchHints":4256,"slots":null}}}}},"staleTime":300,"buildId":"u-BxB-sycHbmKd9o4Sdw5"}
