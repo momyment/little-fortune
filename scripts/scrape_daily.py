@@ -30,10 +30,8 @@ Translation notes (read scripts/README.md for the full story):
   original Japanese, so recurring items keep the site's own wording.
   Unknown items fall back to Google Translate (direct ja -> ko), then
   to the MyMemory public API if Google rate-limits the runner.
-- Summaries are translated with Google Translate via an English pivot
-  (ja -> en -> ko). Direct ja -> ko mangled this colloquial horoscope
-  Japanese ("チャンスが舞い込む" -> "기회가 춤춘다"), while the pivot
-  stays close to the human translations. It is still machine
+- Summaries are also translated with Google Translate, direct ja -> ko
+  (one request per sign, not via English). It is still machine
   translation: the Japanese original is kept in ``ja_summary`` /
   ``ja_lucky`` so any awkward line can be traced and fixed by hand.
 - Translations are cached in ``scripts/translate-cache.json`` (keyed by
@@ -384,13 +382,11 @@ def google_translate_many(texts: list[str], src: str, tgt: str,
 
 
 def translate_summary(ja_text: str, cache: TranslateCache) -> str:
-    """Japanese horoscope summary -> Korean, via an English pivot."""
+    """Japanese horoscope summary -> Korean, direct ja -> ko."""
     hit = cache.get(ja_text, "ja", "ko")
     if hit is not None:
         return hit
-    ko = google_translate(google_translate(ja_text, "ja", "en", cache), "en", "ko", cache)
-    cache.put(ja_text, "ja", "ko", ko)
-    return ko
+    return google_translate(ja_text, "ja", "ko", cache)
 
 
 def load_glossary(root: str) -> dict:
@@ -612,11 +608,8 @@ def translate_entries(entries: list[dict], glossary: dict,
             summaries.append(None)
             uncached_sum.append(entry["ja_summary"])
     if uncached_sum:
-        # Pivot ja -> en -> ko, batched, then remember the direct ja -> ko mapping.
-        ens = google_translate_many(uncached_sum, "ja", "en", cache)
-        kos = google_translate_many(ens, "en", "ko", cache)
-        for ja, ko in zip(uncached_sum, kos):
-            cache.put(ja, "ja", "ko", ko)
+        # Direct ja -> ko, batched. google_translate_many already caches ja|ko.
+        kos = google_translate_many(uncached_sum, "ja", "ko", cache)
         it = iter(kos)
         summaries = [su if su is not None else next(it) for su in summaries]
 
