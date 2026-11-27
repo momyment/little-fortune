@@ -208,12 +208,10 @@ class TranslateTests(unittest.TestCase):
                 "ja_lucky": "白菜",
             }
         ]
-        # Only the summary should hit the network (pivot ja->en, en->ko).
+        # Only the summary should hit the network (direct ja->ko).
         def urlopen(req, timeout=None):
             q = req.full_url
-            if "sl=ja" in q and "tl=en" in q:
-                return FakeResponse(_google_body("A good day"))
-            if "sl=en" in q and "tl=ko" in q:
+            if "sl=ja" in q and "tl=ko" in q:
                 return FakeResponse(_google_body("좋은 하루"))
             raise AssertionError(f"unexpected request {q}")
 
@@ -235,6 +233,20 @@ class TranslateTests(unittest.TestCase):
         urlopen.assert_not_called()
         self.assertEqual(out[0]["lucky"], "배추")
         self.assertEqual(out[1]["summary"], "좋은 하루")
+
+
+    def test_translate_summary_is_direct_ja_ko(self):
+        def urlopen(req, timeout=None):
+            q = req.full_url
+            if "sl=ja" in q and "tl=ko" in q:
+                return FakeResponse(_google_body("좋은 하루"))
+            raise AssertionError(f"unexpected request {q}")
+
+        with mock.patch("urllib.request.urlopen", side_effect=urlopen) as mocked:
+            out = s.translate_summary("良い一日", self.cache)
+        self.assertEqual(out, "좋은 하루")
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(self.cache.get("良い一日", "ja", "ko"), "좋은 하루")
 
     def test_retry_after_http_date(self):
         # A date 10 seconds in the future should produce a ~10s sleep (+jitter).
