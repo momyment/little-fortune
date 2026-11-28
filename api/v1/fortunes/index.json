@@ -2,7 +2,7 @@
   "ok": true,
   "version": 1,
   "type": "fortune-index",
-  "updated_at": "2026-11-27T05:14:35Z",
+  "updated_at": "2026-11-28T03:24:25Z",
   "dates": [
     "2026-10-21",
     "2026-10-22",
@@ -41,7 +41,8 @@
     "2026-11-24",
     "2026-11-25",
     "2026-11-26",
-    "2026-11-27"
+    "2026-11-27",
+    "2026-11-28"
   ],
   "fortunes": {
     "2026-10-21": {
@@ -233,6 +234,11 @@
       "shortcode": "DgNrvIbkjR2",
       "image": "/little-fortune/fortunes/2026-11-27.jpg",
       "source": "https://www.instagram.com/p/DgNrvIbkjR2/"
+    },
+    "2026-11-28": {
+      "shortcode": "DgP86GbDb_J",
+      "image": "/little-fortune/fortunes/2026-11-28.jpg",
+      "source": "https://www.instagram.com/p/DgP86GbDb_J/"
     }
   }
 }
